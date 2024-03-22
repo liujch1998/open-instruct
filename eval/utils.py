@@ -8,6 +8,11 @@ from importlib import import_module
 from transformers import StoppingCriteria
 from eval.dispatch_openai_requests import dispatch_openai_chat_requesets, dispatch_openai_prompt_requesets
 
+from torch.nn import MSELoss, CrossEntropyLoss, BCEWithLogitsLoss
+from typing import Optional, Union, List, Tuple
+from transformers import LlamaForSequenceClassification
+from transformers.modeling_outputs import SequenceClassifierOutputWithPast
+
 
 class KeyWordsCriteria(StoppingCriteria):
     def __init__(self, stop_id_sequences):
@@ -26,6 +31,50 @@ class KeyWordsCriteria(StoppingCriteria):
         return all(sequences_should_be_stopped)
     
     
+@torch.no_grad()
+def mcts_generate_completions(model, value_model, tokenizer, prompts, batch_size=1, add_special_tokens=True, **generation_kwargs):
+    generations = []
+    progress = tqdm.tqdm(total=len(prompts), desc="Generating Completions")
+
+    num_return_sequences = 1
+    for i in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[i:i+batch_size]
+        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
+        batch_input_ids = tokenized_prompts.input_ids
+        attention_mask = tokenized_prompts.attention_mask
+
+        if model.device.type == "cuda":
+            batch_input_ids = batch_input_ids.cuda()
+            attention_mask = attention_mask.cuda()
+
+        from ppo_mcts import PPO_MCTS
+        batch_outputs, output_mask = PPO_MCTS().generate(
+            input_ids=batch_input_ids, attention_mask=attention_mask,
+            tokenizer=tokenizer, policy=model, value_model=value_model,
+            max_new_tokens=generation_kwargs.get("max_new_tokens", 1024),
+            sim=10, k=10,
+            log_level='WARNING',
+        )
+
+        # remove the prompt from the output
+        # we need to re-encode the prompt because we need to make sure the special tokens are treated the same way as in the outputs.
+        # we changed our previous way of truncating the output token ids dicrectly because some tokenizer (e.g., llama) won't add space token before the first token.
+        # space is important for some tasks (e.g., code completion).
+        batch_outputs = [tokenizer.decode(output[mask != tokenizer.pad_token_id], skip_special_tokens=True) for output, mask in zip(batch_outputs, output_mask)]
+        # batch_outputs = tokenizer.batch_decode(batch_outputs, skip_special_tokens=True)
+        batch_prompts = tokenizer.batch_decode(batch_input_ids, skip_special_tokens=True)
+        # duplicate the prompts to match the number of return sequences
+        batch_prompts = [prompt for prompt in batch_prompts for _ in range(num_return_sequences)]
+        batch_generations = [
+            output[len(prompt):] for prompt, output in zip(batch_prompts, batch_outputs)
+        ]
+
+        generations += batch_generations
+        progress.update(len(batch_prompts)//num_return_sequences)
+
+    assert len(generations) == len(prompts) * num_return_sequences, "number of generations should be equal to number of prompts * num_return_sequences"
+    return generations
+
 @torch.no_grad()
 def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequences=None, add_special_tokens=True, disable_tqdm=False, **generation_kwargs):
     generations = []
@@ -209,6 +258,158 @@ def score_completions(model, tokenizer, scoring_examples, batch_size=1, aggregat
 
     return rolled_up_scores
 
+
+# The code is adapted from https://github.com/huggingface/transformers/blob/v4.35.0/src/transformers/models/llama/modeling_llama.py#L1144
+class LlamaForTokenRegression(LlamaForSequenceClassification):
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+
+            # Some generation methods already pass only the last input ID
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = input_ids.shape[1] - 1
+
+            input_ids = input_ids[:, remove_prefix_length:]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        transformer_outputs = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        hidden_states = transformer_outputs[0]
+        logits = self.score(hidden_states)
+
+        logits = logits.squeeze(-1)
+        loss = None
+
+        if not return_dict:
+            output = (logits,) + transformer_outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return SequenceClassifierOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+        )
+
+
+def load_hf_vm_and_tokenizer(
+        model_name_or_path, 
+        tokenizer_name_or_path=None, 
+        device_map="auto", 
+        torch_dtype="auto",
+        load_in_8bit=False, 
+        convert_to_half=False,
+        gptq_model=False,
+        use_fast_tokenizer=True,
+        padding_side="left",
+        token=os.getenv("HF_TOKEN", None)
+    ):
+
+    # Loading OLMo models from HF requires `trust_remote_code=True`.
+    # TODO: Implement this via command-line flag rather than hardcoded list.
+    trusted_models = ["allenai/OLMo-7B", "allenai/OLMo-7B-Twin-2T", "allenai/OLMo-1B"]
+    if model_name_or_path in trusted_models:
+        trust_remote_code = True
+    else:
+        trust_remote_code = False
+
+    from transformers import AutoTokenizer
+    if device_map:
+        model = LlamaForTokenRegression.from_pretrained(
+            model_name_or_path,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            token=token,
+            trust_remote_code=trust_remote_code,
+        )
+    else:
+        model = LlamaForTokenRegression.from_pretrained(
+            model_name_or_path,
+            torch_dtype=torch_dtype,
+            token=token,
+            trust_remote_code=trust_remote_code,
+        )
+        if torch.cuda.is_available():
+            model = model.cuda()
+    if convert_to_half:
+        model = model.half()
+    model.eval()
+
+    if not tokenizer_name_or_path:
+        tokenizer_name_or_path = model_name_or_path
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=use_fast_tokenizer, token=token)
+    except:
+        # some tokenizers (e.g., GPTNeoXTokenizer) don't have the slow or fast version, so we just roll back to the default one
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, token=token)
+    # set padding side to left for batch generation
+    tokenizer.padding_side = padding_side
+    # set pad token to eos token if pad token is not set (as is the case for llama models)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        
+    return model, tokenizer
 
 
 def load_hf_lm_and_tokenizer(

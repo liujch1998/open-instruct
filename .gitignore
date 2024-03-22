@@ -5,6 +5,8 @@ data/*
 # !data/processed
 output/
 beaker_configs/auto_created
+.vscode/
+outputs*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
