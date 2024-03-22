@@ -120,8 +120,12 @@ def main(args):
                     max_new_tokens=512,
                     temperature=0,
                     batch_size=args.eval_batch_size if args.eval_batch_size else 1,
-                    stop_id_sequences=[[stop_sequence]],
+                    stop_id_sequences=[stop_sequence, [29889], [467]], # '__.', ').'
                 )
+                for output in outputs:
+                    output = output.lstrip(' ')
+                    if len(output) == 2 and output[0] == '(' and output[1].isalpha():
+                        output += ')'
         else:
             instances = []
             for i, example in enumerate(task_examples):
