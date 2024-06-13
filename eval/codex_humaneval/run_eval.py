@@ -10,6 +10,8 @@ from eval.utils import (
     load_hf_lm_and_tokenizer, 
     query_openai_chat_model,
     dynamic_import_function,
+    mcts_generate_completions,
+    load_hf_vm_and_tokenizer,
 )
 from eval.codex_humaneval.data import write_jsonl, read_problems
 from eval.codex_humaneval.evaluation import evaluate_functional_correctness
@@ -96,6 +98,14 @@ def main(args):
                 gptq_model=args.gptq,
                 use_fast_tokenizer=not args.use_slow_tokenizer,
             )
+            if args.value_model_name_or_path is not None:
+                value_model, _ = load_hf_vm_and_tokenizer(
+                    model_name_or_path=args.value_model_name_or_path,
+                    tokenizer_name_or_path=args.tokenizer_name_or_path if args.tokenizer_name_or_path is not None else args.model_name_or_path,
+                    load_in_8bit=args.load_in_8bit,
+                    device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
+                    gptq_model=args.gptq,
+                )
             if args.use_chat_format:
                 prompts = [apply_chat_format(tokenizer, inst, suffix) for (inst, suffix) in prompts]
 
@@ -107,18 +117,29 @@ def main(args):
             outputs_per_sampling_iter = []
             for sampling_iter in range(args.unbiased_sampling_size_n):
                 print(f"Sampling iter: {sampling_iter} / {args.unbiased_sampling_size_n}")
-                samping_outputs = generate_completions(
-                    model=model,
-                    tokenizer=tokenizer,
-                    prompts=prompts,
-                    max_new_tokens=512,
-                    batch_size=args.eval_batch_size,
-                    stop_id_sequences=stop_sequences,
-                    num_return_sequences=1,  # we don't use the hf num_return_sequences, because otherwise the real batch size will be multiplied by it and often cause oom.
-                    do_sample=True,  # if only pass@1 is evaluated, we do greedy decoding.
-                    top_p=0.95,
-                    temperature=args.temperature,
-                )
+                if args.value_model_name_or_path is None:
+                    samping_outputs = generate_completions(
+                        model=model,
+                        tokenizer=tokenizer,
+                        prompts=prompts,
+                        max_new_tokens=512,
+                        batch_size=args.eval_batch_size,
+                        stop_id_sequences=stop_sequences,
+                        num_return_sequences=1,  # we don't use the hf num_return_sequences, because otherwise the real batch size will be multiplied by it and often cause oom.
+                        do_sample=True,  # if only pass@1 is evaluated, we do greedy decoding.
+                        top_p=0.95,
+                        temperature=args.temperature,
+                    )
+                else:
+                    outputs = mcts_generate_completions(
+                        model=model,
+                        value_model=value_model,
+                        tokenizer=tokenizer,
+                        prompts=prompts,
+                        max_new_tokens=512,
+                        batch_size=args.eval_batch_size,
+                        stop_id_sequences=stop_sequences, # TODO
+                    )
                 outputs_per_sampling_iter.append(samping_outputs)
             # regroup the outputs to match the number of test data.
             outputs = []

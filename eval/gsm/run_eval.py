@@ -12,6 +12,8 @@ from eval.utils import (
     load_hf_lm_and_tokenizer,
     query_openai_chat_model,
     dynamic_import_function,
+    mcts_generate_completions,
+    load_hf_vm_and_tokenizer,
 )
 from eval.gsm.examplars import EXAMPLARS as GSM_EXAMPLARS
 
@@ -103,20 +105,39 @@ def main(args):
                 gptq_model=args.gptq,
                 use_fast_tokenizer=not args.use_slow_tokenizer,
             )
+            if args.value_model_name_or_path is not None:
+                value_model, _ = load_hf_vm_and_tokenizer(
+                    model_name_or_path=args.value_model_name_or_path,
+                    tokenizer_name_or_path=args.tokenizer_name_or_path if args.tokenizer_name_or_path is not None else args.model_name_or_path,
+                    load_in_8bit=args.load_in_8bit,
+                    device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
+                    gptq_model=args.gptq,
+                )
             if args.use_chat_format:
                 prompts = [apply_chat_format(example, tokenizer) for example in test_data]
             else:
                 prompts = [prompt_prefix + "Question: " + example["question"].strip() + "\nAnswer:" for example in test_data]            
             new_line_token = tokenizer.encode("\n", add_special_tokens=False)[-1] # get the last token because the tokenizer may add space tokens at the start.
-            outputs = generate_completions(
-                model=model,
-                tokenizer=tokenizer,
-                prompts=prompts,
-                max_new_tokens=512,
-                batch_size=args.eval_batch_size,
-                stop_id_sequences=[[new_line_token]] if not args.use_chat_format else None,  # we only use stop token for non-chat format (usually applied to vanilla pretrained language models). For chat format, we will rely on the model knows when to stop.
-                do_sample=False,
-            )
+            if args.value_model_name_or_path is None:
+                outputs = generate_completions(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompts=prompts,
+                    max_new_tokens=512,
+                    batch_size=args.eval_batch_size,
+                    stop_id_sequences=[[new_line_token]] if not args.use_chat_format else None,  # we only use stop token for non-chat format (usually applied to vanilla pretrained language models). For chat format, we will rely on the model knows when to stop.
+                    do_sample=False,
+                )
+            else:
+                outputs = mcts_generate_completions(
+                    model=model,
+                    value_model=value_model,
+                    tokenizer=tokenizer,
+                    prompts=prompts,
+                    max_new_tokens=512,
+                    batch_size=args.eval_batch_size,
+                    s=args.s,
+                )
     else:
         instances = [{"id": prompt, "prompt": prompt} for _, prompt in enumerate(prompts)]
         results = query_openai_chat_model(
@@ -184,6 +205,13 @@ if __name__ == "__main__":
         default=None, 
         help="if specified, we will load the model to generate the predictions."
     )
+    parser.add_argument(
+        "--value_model_name_or_path",
+        type=str,
+        default=None,
+        help="If specified, we will load the model to generate the predictions.",
+    )
+    parser.add_argument('--s', type=int, default=10)
     parser.add_argument(
         "--tokenizer_name_or_path", 
         type=str, 

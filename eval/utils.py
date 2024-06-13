@@ -32,7 +32,7 @@ class KeyWordsCriteria(StoppingCriteria):
     
     
 @torch.no_grad()
-def mcts_generate_completions(model, value_model, tokenizer, prompts, batch_size=1, add_special_tokens=True, **generation_kwargs):
+def mcts_generate_completions(model, value_model, tokenizer, prompts, max_new_tokens, batch_size=1, add_special_tokens=True, s=10):
     generations = []
     progress = tqdm.tqdm(total=len(prompts), desc="Generating Completions")
 
@@ -51,8 +51,8 @@ def mcts_generate_completions(model, value_model, tokenizer, prompts, batch_size
         batch_outputs, output_mask = PPO_MCTS().generate(
             input_ids=batch_input_ids, attention_mask=attention_mask,
             tokenizer=tokenizer, policy=model, value_model=value_model,
-            max_new_tokens=generation_kwargs.get("max_new_tokens", 1024),
-            sim=10, k=10,
+            max_new_tokens=max_new_tokens,
+            sim=s, k=s,
             log_level='WARNING',
         )
 
